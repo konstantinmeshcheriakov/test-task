@@ -5,30 +5,38 @@ from collections import OrderedDict
 
 from aiohttp import web, ClientSession, ClientTimeout
 
+# ---------------- конфигурация ----------------
 PORT = 8000
-MAX_LOCAL = 400_000
-MAX_BYTES = 220 * 1024 * 1024
-CATALOG_TIMEOUT = 2.0
-MAX_CONCURRENT_CATALOG = 4
+MAX_LOCAL = 400_000                      # максимум записей в локальном кэше
+MAX_BYTES = 220 * 1024 * 1024            # 220 МБ — с запасом под 256 МБ лимита
+CATALOG_TIMEOUT = 2.0                    # < 3 с ожидания читателя
+MAX_CONCURRENT_CATALOG = 4               # throttle к каталогу
 BACKOFF_MAX = 30.0
 BACKOFF_BASE = 1.0
-MAX_BODY = 200 * 1024 * 1024
+MAX_BODY = 200 * 1024 * 1024             # aiohttp не должен рубить снимок 110 МБ
+MAX_LINE = 2 * 1024 * 1024               # предохранитель на строку снимка
 
 
+# ================= ХРАНИЛИЩЕ =================
 class Store:
     def __init__(self):
-        self.data = OrderedDict()
-        self.removed = set()
+        # id -> готовые JSON-байты записи
+        self.data: OrderedDict[str, bytes] = OrderedDict()
+        # снятые через DELETE — не отдаём до следующего снимка
+        self.removed: set[str] = set()
+        # текущий объём data в байтах
         self.bytes = 0
+
+        # счётчики (монотонно растут)
         self.served_local = 0
         self.served_from_catalog = 0
         self.catalog_reads = 0
         self.evictions = 0
 
-    def get_local(self, qid):
+    def get_local(self, qid: str):
         return self.data.get(qid)
 
-    def put_local(self, qid, body):
+    def put_local(self, qid: str, body: bytes):
         old = self.data.get(qid)
         if old is not None:
             self.bytes -= len(old)
@@ -43,7 +51,7 @@ class Store:
             self.bytes -= len(body)
             self.evictions += 1
 
-    def remove(self, qid):
+    def remove(self, qid: str) -> bool:
         existed = qid in self.data or qid in self.removed
         old = self.data.pop(qid, None)
         if old is not None:
@@ -51,10 +59,11 @@ class Store:
         self.removed.add(qid)
         return existed
 
-    def replace_snapshot(self, new_data, new_bytes):
+    def replace_snapshot(self, new_data: OrderedDict, new_bytes: int) -> int:
         old_ids = set(self.data.keys())
         new_ids = set(new_data.keys())
         dropped = len(old_ids - new_ids)
+
         self.data = new_data
         self.bytes = new_bytes
         self.removed.clear()
@@ -62,29 +71,33 @@ class Store:
         return dropped
 
 
+# ================= КЛИЕНТ КАТАЛОГА =================
 class CatalogClient:
-    def __init__(self, store):
+    def __init__(self, store: Store):
         self.store = store
-        self.url = None
-        self.session = None
+        self.url: str | None = None
+        self.session: ClientSession | None = None
         self.sem = asyncio.Semaphore(MAX_CONCURRENT_CATALOG)
         self.backoff_until = 0.0
         self.backoff = 0.0
-        self.inflight = {}
+        self.inflight: dict[str, asyncio.Future] = {}
 
-    def set_url(self, url):
+    def set_url(self, url: str):
         self.url = url.rstrip('/')
         self.backoff_until = 0.0
         self.backoff = 0.0
 
-    async def fetch(self, qid):
+    async def fetch(self, qid: str):
         if self.url is None:
             return None
         if time.monotonic() < self.backoff_until:
             return None
+
+        # single-flight: одинаковые id не порождают дублей запросов
         fut = self.inflight.get(qid)
         if fut is not None:
             return await fut
+
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
         self.inflight[qid] = fut
@@ -98,10 +111,12 @@ class CatalogClient:
         finally:
             self.inflight.pop(qid, None)
 
-    async def _do_fetch(self, qid):
+    async def _do_fetch(self, qid: str):
         async with self.sem:
+            # повторная проверка после ожидания семафора
             if time.monotonic() < self.backoff_until:
                 return None
+
             self.store.catalog_reads += 1
             try:
                 async with self.session.get(
@@ -123,6 +138,7 @@ class CatalogClient:
                             delay = BACKOFF_BASE
                         self._apply_backoff(delay)
                         return None
+                    # неожиданный код
                     self._apply_backoff(None)
                     return None
             except (asyncio.TimeoutError, OSError):
@@ -141,12 +157,21 @@ class CatalogClient:
         self.backoff_until = 0.0
 
 
-async def _parse_snapshot(request):
+# ================= ПАРСЕР СНИМКА =================
+async def _parse_snapshot(request) -> tuple[OrderedDict, int]:
+    """
+    Построчный стриминговый парсинг.
+    Формат гарантирован:
+        {"quotes":[
+        {...},
+        {...},
+        ]}
+    Возвращает (data: id -> bytes, total_bytes).
+    """
     buf = bytearray()
-    new_data = OrderedDict()
+    new_data: OrderedDict[str, bytes] = OrderedDict()
     total_bytes = 0
-    state = 0
-    MAX_LINE = 2 * 1024 * 1024
+    state = 0  # 0 — ждём преамбулу, 1 — читаем записи, 2 — конец
 
     async for chunk in request.content.iter_chunked(64 * 1024):
         buf.extend(chunk)
@@ -158,13 +183,16 @@ async def _parse_snapshot(request):
                 break
             line = bytes(buf[:nl]).strip()
             del buf[:nl + 1]
+
             if not line:
                 continue
+
             if state == 0:
                 if line != b'{"quotes":[':
                     raise ValueError('bad preamble')
                 state = 1
                 continue
+
             if state == 1:
                 if line == b']}':
                     state = 2
@@ -180,20 +208,29 @@ async def _parse_snapshot(request):
                 qid = rec.get('id')
                 if not isinstance(qid, str) or not qid:
                     raise ValueError('bad id')
-                body = json.dumps(rec, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+                body = json.dumps(
+                    rec, ensure_ascii=False, separators=(',', ':')
+                ).encode('utf-8')
                 new_data[qid] = body
                 total_bytes += len(body)
                 continue
+
+            if state == 2:
+                # после ]} осмысленных данных нет
+                continue
+
     if state != 2:
         raise ValueError('incomplete snapshot')
     return new_data, total_bytes
 
 
+# ================= ГЛОБАЛЬНОЕ СОСТОЯНИЕ =================
 store = Store()
 catalog = CatalogClient(store)
 import_lock = asyncio.Lock()
 
 
+# ================= ХЕНДЛЕРЫ =================
 async def handle_health(request):
     return web.json_response({"status": "healthy"})
 
@@ -219,7 +256,10 @@ async def handle_import(request):
         except ValueError as e:
             raise web.HTTPBadRequest(text=str(e))
         dropped = store.replace_snapshot(new_data, total_bytes)
-    return web.json_response({"imported": len(new_data), "dropped": dropped})
+    return web.json_response({
+        "imported": len(new_data),
+        "dropped": dropped,
+    })
 
 
 async def handle_put(request):
@@ -228,15 +268,20 @@ async def handle_put(request):
         payload = await request.json()
     except Exception:
         raise web.HTTPBadRequest(text='invalid json')
+
     author = payload.get('author')
     text = payload.get('text')
     if not isinstance(author, str) or not (1 <= len(author) <= 200):
         raise web.HTTPUnprocessableEntity(text='author invalid')
     if not isinstance(text, str) or not (1 <= len(text) <= 16384):
         raise web.HTTPUnprocessableEntity(text='text invalid')
+
     rec = dict(payload)
     rec['id'] = qid
-    body = json.dumps(rec, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    body = json.dumps(
+        rec, ensure_ascii=False, separators=(',', ':')
+    ).encode('utf-8')
+
     store.removed.discard(qid)
     store.put_local(qid, body)
     return web.json_response(rec)
@@ -251,20 +296,30 @@ async def handle_delete(request):
 
 async def handle_get_quote(request):
     qid = request.match_info['quote_id']
+
     if qid in store.removed:
         raise web.HTTPNotFound(text='not found')
+
     body = store.get_local(qid)
     if body is not None:
         store.served_local += 1
-        return web.Response(body=body, content_type='application/json',
-                            headers={'X-Source': 'LOCAL'})
+        return web.Response(
+            body=body,
+            content_type='application/json',
+            headers={'X-Source': 'LOCAL'},
+        )
+
     store.served_from_catalog += 1
     body = await catalog.fetch(qid)
     if body is None:
         raise web.HTTPNotFound(text='not found')
+
     store.put_local(qid, body)
-    return web.Response(body=body, content_type='application/json',
-                        headers={'X-Source': 'CATALOG'})
+    return web.Response(
+        body=body,
+        content_type='application/json',
+        headers={'X-Source': 'CATALOG'},
+    )
 
 
 async def handle_stats(request):
@@ -279,6 +334,7 @@ async def handle_stats(request):
     })
 
 
+# ================= ЖИЗНЕННЫЙ ЦИКЛ =================
 async def on_startup(app):
     catalog.session = ClientSession()
 
